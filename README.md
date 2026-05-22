@@ -7,16 +7,17 @@
 - v1.0 系统方案定稿，详见 [docs/SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md)
 - 实施进度：尚未启动 P0
 
-## 方案速览（v1.1）
+## 方案速览（v1.2）
 
 - **定位**：**只读外挂索引层** — 不接管 NAS 入库，不动原文件位置和组织
 - **架构**：NAS 只存储 + Mac 跑服务 + Web SPA + Immich 共生
-- **NAS 上仅有 `.nasmgr/`**：catalog.db + labels.jsonl，可重建/可手动清理
-- **衍生物**：默认 Mac 本地缓存（缩略图/代理片/向量）
+- **catalog.db 在 Mac 本地**（v1.2 由 NAS 迁回）：~1.8GB 体量，本地查询快 30-50 倍，NAS 离线时仍可浏览/标注
+- **NAS 上仅 `.nasmgr/labels.jsonl`**：标注真值（append-only），catalog.db 可从此 + 扫描重建
+- **衍生物**：缩略图/代理片/向量全部 Mac 本地缓存（约 400GB）
 - **核心模型**：Asset / Event / Segment / Person / Place / Tag / SmartAlbum
 - **羽毛球四层**：Session → Match → Game → Rally，结构化标注复盘
 - **检索八维**：时间 / 人物 / 地点 / 类别 / 标签 / 语义 / 聚合 / 导出
-- **写动作**：仅"按需导出"（用户主动触发）
+- **写动作**：仅"按需导出"（用户主动触发）+ 标注追加 labels.jsonl
 
 ## 文档
 

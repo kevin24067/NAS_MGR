@@ -1,12 +1,12 @@
 # NAS-MGR 系统设计文档
 
-> 版本：v1.1 · 修订日期：2026-05-22
+> 版本：v1.2 · 修订日期：2026-05-22
 > 状态：方案定型，待进入实施分期 P0
 > 维护者：KH
 >
-> **v1.1 重大修订**：本系统**仅作为外挂索引层**，不接管 NAS 上的素材入库与组织。
-> 原文件位置、目录结构、命名方式由用户/其他工具（手机同步、Immich 等）维护，
-> NAS-MGR 只负责"扫描发现 → 索引 → 标注/检索 → 按需导出"。
+> **v1.1**：仅作为外挂索引层，不接管 NAS 入库。
+> **v1.2**：catalog.db 主库迁回 Mac 本地（~1.8GB 体量小，本地查询快 30-50 倍）；
+> NAS 上仅保留 `.nasmgr/labels.jsonl` 作为标注真值备份。
 
 ---
 
@@ -21,7 +21,7 @@
 | 决策项 | 选择 | 含义 |
 |---|---|---|
 | **A. 部署形态** | A2 | NAS 只做存储，所有服务（API、Worker、AI）跑在 Mac 上 |
-| **B. 元数据库位置** | B1 | SQLite 主库 `catalog.db` 存放在 NAS 的 `.nasmgr/` 隐藏目录 |
+| **B. 元数据库位置** | B2 | SQLite 主库 `catalog.db` 存放在 Mac 本地（v1.2 由 B1 改为 B2，体量小、查询快、离线可用） |
 | **C. 索引触发** | C2 | 显式 `nasmgr scan` 命令触发；后续可演进到 watch |
 | **D. 照片栈选型** | D2 | Immich 接管日常照片/视频浏览与人脸；NAS-MGR 自研羽毛球/骑行/专题层 |
 | **E. 羽毛球 AI 程度** | E1 | AI 只生成"回合切分候选"，比分/发球人/得分方/技术标签全部走人工标注 |
@@ -30,6 +30,7 @@
 | **H. 标注 UI** | H1 | Web 端键盘流（空格/数字键/ASD 等快捷键） |
 
 > **v1.1 关键变更**：决策 C 由"入库触发"改为"索引触发"。NAS-MGR 不再有"入库管线"概念，只做被动扫描。原 `inbox/` 暂存区方案废弃。
+> **v1.2 关键变更**：决策 B 由 B1（catalog.db 在 NAS）改为 B2（catalog.db 在 Mac 本地）。原因：实测预估 catalog.db ~1.8GB、CLIP 向量 ~3GB，体量小，本地查询比走 SMB 快 30-50 倍，且支持 NAS 离线时浏览/标注。NAS 上仅保留 `labels.jsonl` 作为标注真值备份。
 
 ---
 
@@ -58,40 +59,62 @@
 │       /media/cycling/2026-05-20-meishan/                              │
 │  NAS-MGR 只读消费这些路径，不改任何文件                                 │
 │                                                                       │
-│  /.nasmgr/                ← NAS-MGR 唯一在 NAS 上写入的目录            │
-│      catalog.db           ← SQLite 主库（可重建）                      │
-│      catalog.db-wal                                                    │
-│      labels.jsonl         ← 每日标注备份（人工产物，不可丢）           │
+│  /.nasmgr/                ← NAS-MGR 在 NAS 上唯一写入的目录            │
+│      labels.jsonl         ← 标注真值备份（人工产物，不可丢；append-only）│
+│      labels.jsonl.daily/  ← 每日快照（轮转）                            │
 └────────────┬─────────────────────────────────────────────────────────┘
              │ SMB 挂载（autofs）→ /Volumes/nas-media（只读挂载）
              ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                            Mac（计算 + UI）                            │
+│                            Mac（计算 + UI + 索引）                      │
+│                                                                       │
+│  ~/Library/Application Support/nasmgr/                                │
+│      catalog.db          ← SQLite 主库（v1.2 由 NAS 迁来；~1.8GB）     │
+│      catalog.db-wal                                                   │
+│      vec/                ← sqlite-vec 向量索引（~3GB）                 │
+│                                                                       │
+│  ~/Library/Caches/nasmgr/                                             │
+│      thumbs/             ← 缩略图三档（~80GB）                         │
+│      proxies/            ← 720p 代理片（~300GB）                       │
+│      keyframes/          ← 关键帧（~15GB）                             │
+│                                                                       │
 │  nasmgr-api      FastAPI · REST/JSON                                  │
 │  nasmgr-worker   AI/抽帧/embed 的本地 worker                           │
 │  nasmgr-web      Web SPA · 浏览 / 标注 / 导出                          │
-│  ~/Library/.../nasmgr-cache/    ← 衍生物本地缓存（缩略图/代理片/向量）  │
 │  immich          Docker · 接管日常浏览（D2 共生）                      │
 │  高德 API        地理编码                                              │
 └────────────┬─────────────────────────────────────────────────────────┘
+             │ 标注变更立即同步追加到 NAS labels.jsonl
              │ 用户主动触发导出
              ▼
         /Volumes/nas-media/Exports/  ← 仅在导出时写入 NAS
         或本地 ~/Movies/Exports/
 ```
 
-### 2.3 衍生物存放策略
+### 2.3 衍生物与索引存放策略（v1.2）
 
-| 衍生物 | 默认位置 | 可选位置 | 说明 |
+| 数据 | 默认位置 | 可重建 | 备份策略 |
 |---|---|---|---|
-| 缩略图（256/512/1024） | Mac 本地 `~/Library/Caches/nasmgr/thumbs/` | NAS `.nasmgr/cache/` | 本地默认，加载快；多设备共享时可选 NAS |
-| 视频代理片（720p） | Mac 本地 `~/Library/Caches/nasmgr/proxies/` | NAS | 同上 |
-| 关键帧 | Mac 本地 | NAS | 同上 |
-| CLIP 向量 / 人脸 | Mac 本地 sqlite-vec 文件 | NAS | 默认本地，重建廉价 |
-| 标注数据 | **NAS `.nasmgr/catalog.db` 主存** + 每日 JSONL 导出 | — | 人工产物，必须落 NAS |
-| 集锦/导出成片 | 用户指定目标目录 | — | 写到哪由用户在导出时决定 |
+| **catalog.db**（SQLite 主库） | `~/Library/Application Support/nasmgr/catalog.db` | 可（从扫描+labels.jsonl 重建） | 每日快照到 NAS `.nasmgr/snapshots/` |
+| **CLIP 向量索引** | `~/Library/Application Support/nasmgr/vec/` | 可（重跑 embed） | 不备份 |
+| 缩略图（256/512/1024） | `~/Library/Caches/nasmgr/thumbs/` | 可 | 不备份 |
+| 视频代理片（720p） | `~/Library/Caches/nasmgr/proxies/` | 可 | 不备份 |
+| 关键帧 | `~/Library/Caches/nasmgr/keyframes/` | 可 | 不备份 |
+| **标注真值** | `/Volumes/nas-media/.nasmgr/labels.jsonl`（append-only）| 否 | 这个就是备份；每日轮转 |
+| 集锦/导出成片 | 用户指定目标目录 | — | 用户自管 |
 
-> 默认所有可重建产物在 Mac 本地，NAS 上只有 `.nasmgr/catalog.db` 和 `.nasmgr/labels.jsonl` 两个文件——一个保存索引和标注（可由 JSONL 重建），一个是标注的纯文本备份（人工劳动结晶，不可丢）。
+**为什么 catalog.db 在 Mac 本地（v1.2 决定）**：
+
+1. **体量小**：实测预估 ~1.8GB（41 万 Asset + 80 万人脸 + 10 万 Segment + 索引），Mac 本地无感
+2. **查询快**：本地 SQLite P95 < 5ms；走 SMB 网络的话 P95 30-200ms，慢 30-50 倍
+3. **离线可用**：NAS 关机/网络中断时仍能浏览、标注；新标注先暂存本地，下次连上 NAS 自动同步追加 `labels.jsonl`
+4. **索引可重建**：catalog.db 任何时候删除/损坏都能从 (a) 重新扫描原文件 + (b) 回放 `labels.jsonl` 完全恢复
+
+**为什么 labels.jsonl 必须在 NAS（不变）**：
+
+1. **唯一不可重建的人工产物**——AI 切回合可重做，标签可重打，但人工标注的 rally_quality / 战术 / 笔记是劳动结晶
+2. NAS 通常有 RAID + 异地备份，比 Mac 本地硬盘可靠
+3. 多设备未来共享时是真值源
 
 ---
 
@@ -325,17 +348,68 @@ output: /Volumes/nas-media/Exports/violent-smash-2026.mp4
 
 ---
 
-## 8. 非功能需求（v1.1 调整）
+## 8. 非功能需求（v1.2 调整）
 
 | 维度 | 要求 |
 |---|---|
 | **可重建性** | catalog.db 删除可从扫描 + labels.jsonl 重建（标注不丢，索引重跑） |
-| **零侵入** | 删除 NAS-MGR 后 NAS 上只剩 `.nasmgr/` 一个目录可手动删，原文件无任何变化 |
-| 备份 | 用户自管 raw 备份；`.nasmgr/labels.jsonl` 也建议进备份链 |
+| **零侵入** | 删除 NAS-MGR 后 NAS 上只剩 `.nasmgr/labels.jsonl`，可手动删；原文件无任何变化 |
+| **离线可用（v1.2 新增）** | NAS 不可达时仍能浏览/标注/检索（catalog.db 在本地）；新标注暂存 Mac 本地，NAS 恢复后自动同步追加 `labels.jsonl` |
+| 备份 | 用户自管 raw 备份；`.nasmgr/labels.jsonl` 进备份链；catalog.db 每日快照到 NAS `.nasmgr/snapshots/` |
 | 隐私 | privacy_level=high → 跳过 AI 处理 |
-| 性能 | 扫描 ≥ 5000 文件/分钟（仅元数据，不含 hash 大文件）；查询 P95 < 200ms |
+| 性能 | 扫描 ≥ 5000 文件/分钟（仅元数据，不含 hash 大文件）；本地查询 P95 < 5ms（v1.2 由 < 200ms 提升） |
 | 扫描鲁棒性 | 部分路径不可用时跳过 + 报告，不中断整次扫描 |
 | 文件移动追踪 | 用户重命名/移动后下次扫描自动识别（sha256 匹配） |
+| **存储占用（v1.2 估算）** | Mac 本地：catalog.db ~1.8GB + 向量 ~3GB + 缩略图 ~80GB + 代理片 ~300GB ≈ **390GB**；NAS 上仅 labels.jsonl ~10MB |
+
+### 8.1 数据规模预估（基于 5TB 素材的精算 · v1.2）
+
+**素材分布假设**：
+
+| 类型 | 单文件均值 | 占比 | 文件数 |
+|---|---|---|---|
+| 照片（HEIC/JPG/RAW） | ~5MB | 2 TB | ~400,000 |
+| 日常视频 | ~150MB | 1.5 TB | ~10,000 |
+| 羽毛球视频（7-12min） | ~700MB | 1 TB | ~1,400 |
+| 骑行视频 | ~1.5GB | 0.5 TB | ~350 |
+| **合计** | | **5 TB** | **~412,000** |
+
+**catalog.db 各表条数与体量**：
+
+| 表 | 条数 | 单行 | 小计 |
+|---|---|---|---|
+| asset | 412,000 | ~400B | 165 MB |
+| asset_path_history | 500,000 | ~120B | 60 MB |
+| event | ~5,000 | ~300B | 1.5 MB |
+| asset_event | ~500,000 | ~24B | 12 MB |
+| segment（绝大多数 Rally）| ~100,000 | ~500B | 50 MB |
+| face（含 512f embedding）| ~800,000 | ~600B | **800 MB** ← 大头 |
+| asset_person | ~600,000 | ~24B | 14 MB |
+| place / tag / smart_album | <1,000 总 | — | <1 MB |
+| tag_link | ~1,500,000 | ~32B | 48 MB |
+| job（轮转）| ~50,000 | ~300B | 15 MB |
+| FTS5 索引 | — | — | 150 MB |
+| btree 索引开销 | — | ~30-50% | ~500 MB |
+| **catalog.db 合计** | | | **~1.8 GB** |
+
+**CLIP 向量索引（独立 sqlite-vec 文件）**：
+
+| 项 | 条数 | 单条（fp16）| 小计 |
+|---|---|---|---|
+| 照片 CLIP 嵌入 | 400,000 | 1 KB | 0.4 GB |
+| 视频关键帧 CLIP（每 60s 一帧）| ~1,000,000 | 1 KB | 1.0 GB |
+| 索引结构开销 | — | — | ~1.5 GB |
+| **向量合计** | | | **~3 GB** |
+
+**衍生物缓存（Mac 本地，可重建）**：
+
+| 衍生物 | 估算 |
+|---|---|
+| 缩略图 256/512/1024 三档 | ~80 GB |
+| 视频代理片 720p H.264 | ~250-300 GB |
+| 视频关键帧 JPG | ~15 GB |
+
+**结论**：Mac 本地需空闲 **~400 GB** 容量。catalog.db 本身仅 ~1.8GB 完全无感，主要空间花在视频代理片上。如果 Mac 空间紧，代理片可改为按需生成（只为最近浏览/标注的视频生成代理片，其他懒加载）。
 
 ---
 
@@ -393,6 +467,14 @@ NAS-MGR/
 ---
 
 ## 12. 修订历史
+
+### v1.2 · 2026-05-22
+- **决策 B 修订**：catalog.db 由 NAS（B1）改为 Mac 本地（B2）。
+- 触发原因：精算后 catalog.db ~1.8GB、向量 ~3GB，体量小，本地查询比走 SMB 快 30-50 倍。
+- NAS 上仅保留 `.nasmgr/labels.jsonl` 作为标注真值备份（append-only），catalog.db 灾难时可从扫描 + labels.jsonl 重建。
+- 新增"离线可用"非功能需求：NAS 不可达时仍能浏览/标注。
+- 新增 8.1 节"数据规模预估"，给出 5TB 体量下各表条数与字节估算。
+- 性能指标：本地查询 P95 由 < 200ms 提升为 < 5ms。
 
 ### v1.1 · 2026-05-22
 - **重大架构修订**：废弃"入库管线"概念，改为只读外挂索引。
