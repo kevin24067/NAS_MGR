@@ -1,14 +1,18 @@
 # NAS-MGR 系统设计文档
 
-> 版本：v1.0 · 定稿日期：2026-05-22
+> 版本：v1.1 · 修订日期：2026-05-22
 > 状态：方案定型，待进入实施分期 P0
 > 维护者：KH
+>
+> **v1.1 重大修订**：本系统**仅作为外挂索引层**，不接管 NAS 上的素材入库与组织。
+> 原文件位置、目录结构、命名方式由用户/其他工具（手机同步、Immich 等）维护，
+> NAS-MGR 只负责"扫描发现 → 索引 → 标注/检索 → 按需导出"。
 
 ---
 
 ## 0. 一句话目标
 
-把分散在 NAS 上的 5TB 照片视频（羽毛球 / 骑行 / 日常 / 旅行）从"文件堆"变成"可按时间·地点·人物·类别·专题随意检索、可对羽毛球视频做结构化复盘、可一键导出主题集锦"的私人媒体管理系统。
+把 NAS 上**已存在**的 5TB 照片视频（羽毛球 / 骑行 / 日常 / 旅行）以**只读外挂索引**的方式接入，做到可按时间·地点·人物·类别·专题检索、可对羽毛球视频做结构化复盘、可按需导出主题集锦——**而完全不改变 NAS 上的任何原文件位置和组织方式**。
 
 ---
 
@@ -17,578 +21,358 @@
 | 决策项 | 选择 | 含义 |
 |---|---|---|
 | **A. 部署形态** | A2 | NAS 只做存储，所有服务（API、Worker、AI）跑在 Mac 上 |
-| **B. 元数据库位置** | B1 | SQLite 主库 `catalog.db` 存放在 NAS 的 `index/` 目录，单点真理 |
-| **C. 入库触发** | C2 | 显式 `nasmgr import` 命令触发，可控可排查；后续可演进到 watch |
-| **D. 照片栈选型** | D2 | Immich 接管日常照片/视频的浏览与人脸；NAS-MGR 自研羽毛球/骑行/专题层 |
+| **B. 元数据库位置** | B1 | SQLite 主库 `catalog.db` 存放在 NAS 的 `.nasmgr/` 隐藏目录 |
+| **C. 索引触发** | C2 | 显式 `nasmgr scan` 命令触发；后续可演进到 watch |
+| **D. 照片栈选型** | D2 | Immich 接管日常照片/视频浏览与人脸；NAS-MGR 自研羽毛球/骑行/专题层 |
 | **E. 羽毛球 AI 程度** | E1 | AI 只生成"回合切分候选"，比分/发球人/得分方/技术标签全部走人工标注 |
 | **F. 地图服务** | F1 | 高德地图 API（在线，需 GCJ02 纠偏） |
 | **G. 前端形态** | G1 | 单 Web SPA |
 | **H. 标注 UI** | H1 | Web 端键盘流（空格/数字键/ASD 等快捷键） |
 
-锁定这 8 个决策后，本文档其余部分的所有约束都是这套组合的直接推论。
+> **v1.1 关键变更**：决策 C 由"入库触发"改为"索引触发"。NAS-MGR 不再有"入库管线"概念，只做被动扫描。原 `inbox/` 暂存区方案废弃。
 
 ---
 
-## 2. 总体架构
+## 2. 核心架构原则（v1.1 重写）
 
-### 2.1 拓扑
+### 2.1 NAS-MGR 是外挂索引，不是文件管理器
+
+| ✅ NAS-MGR 做 | ❌ NAS-MGR 不做 |
+|---|---|
+| 扫描 NAS 上指定路径，发现媒体文件 | 移动、重命名、删除任何文件 |
+| 读取 EXIF/元数据，建立 SQLite 索引 | 在 NAS 上规定目录结构 |
+| 在本地缓存生成缩略图、向量、人脸 | 在 NAS 上写衍生物（默认） |
+| 提供检索 + 标注 + 按需导出 | 接管手机同步、自动归档 |
+| 标注数据持久化 | 改写原始文件的 metadata（除非明确导出） |
+
+**核心不变量**：在 NAS 上的原文件**只读**。索引可以全部清空重建，原文件永远不变。
+
+### 2.2 拓扑
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                              NAS（存储 + 元数据）                       │
-│   /media/raw/         5TB 原始素材，只读                                │
-│   /media/inbox/       待入库暂存区                                       │
-│   /media/derived/     缩略图 / 代理片 / 关键帧 / 导出                    │
-│   /media/index/       catalog.db（SQLite 主库） + 向量索引              │
+│                          NAS（用户已有的存储）                          │
+│  现有目录结构 ← 由用户/手机同步/Immich 等工具维护                        │
+│  例：/media/photos/2024/...                                            │
+│       /media/badminton/2026-05-22-橙天/                               │
+│       /media/cycling/2026-05-20-meishan/                              │
+│  NAS-MGR 只读消费这些路径，不改任何文件                                 │
+│                                                                       │
+│  /.nasmgr/                ← NAS-MGR 唯一在 NAS 上写入的目录            │
+│      catalog.db           ← SQLite 主库（可重建）                      │
+│      catalog.db-wal                                                    │
+│      labels.jsonl         ← 每日标注备份（人工产物，不可丢）           │
 └────────────┬─────────────────────────────────────────────────────────┘
-             │ SMB 挂载（autofs）→ /Volumes/nas-media
+             │ SMB 挂载（autofs）→ /Volumes/nas-media（只读挂载）
              ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │                            Mac（计算 + UI）                            │
-│   nasmgr-api    FastAPI · 暴露 REST/JSON                               │
-│   nasmgr-worker AI/转码/扫描的后台 worker                                │
-│   nasmgr-web    Vue/Svelte SPA · 浏览 + 标注 + 导出                     │
-│   immich        Docker 起的 Immich，接管日常照片/视频与人脸             │
-│   高德 API      地理编码 / 反查 / GCJ02                                 │
-└──────────────────────────────────────────────────────────────────────┘
+│  nasmgr-api      FastAPI · REST/JSON                                  │
+│  nasmgr-worker   AI/抽帧/embed 的本地 worker                           │
+│  nasmgr-web      Web SPA · 浏览 / 标注 / 导出                          │
+│  ~/Library/.../nasmgr-cache/    ← 衍生物本地缓存（缩略图/代理片/向量）  │
+│  immich          Docker · 接管日常浏览（D2 共生）                      │
+│  高德 API        地理编码                                              │
+└────────────┬─────────────────────────────────────────────────────────┘
+             │ 用户主动触发导出
+             ▼
+        /Volumes/nas-media/Exports/  ← 仅在导出时写入 NAS
+        或本地 ~/Movies/Exports/
 ```
 
-### 2.2 服务边界
+### 2.3 衍生物存放策略
 
-| 服务 | 职责 | 不做的事 |
-|---|---|---|
-| **nasmgr-api** | 业务读写、查询、专题、导出 | 不直接跑 AI（投递到 worker） |
-| **nasmgr-worker** | 扫描入库、转码、AI 嵌入、人脸、回合切分 | 不暴露外部接口，只消费任务 |
-| **nasmgr-web** | 浏览/搜索/羽毛球标注/集锦剪辑 | 不直连 NAS 文件，统统过 API |
-| **immich**（D2 混合） | 日常照片视频展示、人脸识别、移动端同步 | 不参与羽毛球结构化标注 |
+| 衍生物 | 默认位置 | 可选位置 | 说明 |
+|---|---|---|---|
+| 缩略图（256/512/1024） | Mac 本地 `~/Library/Caches/nasmgr/thumbs/` | NAS `.nasmgr/cache/` | 本地默认，加载快；多设备共享时可选 NAS |
+| 视频代理片（720p） | Mac 本地 `~/Library/Caches/nasmgr/proxies/` | NAS | 同上 |
+| 关键帧 | Mac 本地 | NAS | 同上 |
+| CLIP 向量 / 人脸 | Mac 本地 sqlite-vec 文件 | NAS | 默认本地，重建廉价 |
+| 标注数据 | **NAS `.nasmgr/catalog.db` 主存** + 每日 JSONL 导出 | — | 人工产物，必须落 NAS |
+| 集锦/导出成片 | 用户指定目标目录 | — | 写到哪由用户在导出时决定 |
 
-> Immich 与 NAS-MGR 各管各的库，**通过同一份 raw/ 物理路径共享素材**。两边的元数据库不打通；用户在浏览器里有"日常→Immich，赛事→NAS-MGR"的清晰心智。
+> 默认所有可重建产物在 Mac 本地，NAS 上只有 `.nasmgr/catalog.db` 和 `.nasmgr/labels.jsonl` 两个文件——一个保存索引和标注（可由 JSONL 重建），一个是标注的纯文本备份（人工劳动结晶，不可丢）。
 
 ---
 
-## 3. 存储约定
+## 3. 索引发现机制（替代原"入库管线"）
 
-### 3.1 NAS 目录结构（最终态）
+### 3.1 配置驱动的扫描根
+
+`nasmgr.config.yaml`（项目根，git 管理）：
+
+```yaml
+scan_roots:
+  - path: /Volumes/nas-media/photos
+    kind: photo                  # 默认按 EXIF 分类
+    recursive: true
+
+  - path: /Volumes/nas-media/badminton
+    kind: badminton              # 暗示走羽毛球处理插件
+    recursive: true
+    metadata_overrides:
+      default_category: category/badminton
+
+  - path: /Volumes/nas-media/cycling
+    kind: cycling
+    recursive: true
+
+  - path: /Volumes/nas-media/daily
+    kind: daily
+
+ignore_patterns:
+  - "**/.*"                      # 隐藏文件
+  - "**/@eaDir/**"               # 群晖缩略图缓存
+  - "**/Thumbs.db"
+  - "**/.DS_Store"
+
+extensions:
+  photo: [jpg, jpeg, heic, heif, png, raw, dng, arw, cr2, nef]
+  video: [mp4, mov, m4v, mkv, avi, mts]
+```
+
+**关键点**：用户可以**任意调整 NAS 上的目录结构**，只要在配置里更新扫描根即可。系统不绑定任何特定布局。
+
+### 3.2 扫描命令
+
+```bash
+nasmgr scan                       # 全量增量扫描所有 scan_roots
+nasmgr scan --root /path          # 仅扫指定根
+nasmgr scan --since 2026-05-01    # 只看修改时间晚于该日期
+nasmgr scan --dry-run             # 只报告变更，不写库
+```
+
+### 3.3 扫描流程
 
 ```
-/media/
-├── inbox/                           # 待入库（用户/同步工具往这里扔）
-│   ├── phone/                       # 手机自动同步
-│   ├── camera/                      # 相机/运动相机拷卡
-│   ├── badminton/YYYY-MM-DD/        # 球场视频
-│   └── cycling/YYYY-MM-DD/          # 骑行视频 + GPX
-│
-├── raw/                             # 已入库 · 系统管理 · 只读
-│   ├── 2026/05/22/
-│   │   ├── IMG_2034_<hash6>.heic
-│   │   ├── VID_2034_<hash6>.mp4
-│   │   └── badminton-court-A_<hash6>.mp4
-│   └── ...
-│
-├── derived/                         # 衍生物 · 可重建可删
-│   ├── thumbnails/{256,512,1024}/   # 三档缩略图
-│   ├── proxies/                     # 视频 720p H.264 代理片
-│   ├── keyframes/                   # 视频每 N 秒抽一帧
-│   └── exports/                     # 集锦/合集导出
-│
-├── archive/                         # 同源低质副本降级存放
-│
-└── index/                           # 索引 · 全部可重建
-    ├── catalog.db                   # SQLite 主库（FTS5 + sqlite-vec）
-    ├── catalog.db-wal               # WAL
-    └── vec/                         # 向量索引落盘
+[1] 遍历 scan_roots 中所有路径（受 ignore_patterns 过滤）
+   │
+   ▼
+[2] 对每个文件：
+    ├─ 已在 asset 表（按 path）：
+    │   ├─ mtime + size 一致 → 跳过
+    │   └─ 不一致 → 重新读 EXIF / 重算 hash → 更新行
+    │
+    └─ 不在 asset 表：
+        ├─ 读 EXIF/ffprobe 获取元数据
+        ├─ 算 sha256（增量大文件用流式）
+        ├─ 检查同 sha256 是否已存在（重定位检测）
+        │   └─ 如存在 → 仅在 asset_path_history 加一条新路径
+        ├─ 否则插入新 asset 行
+        └─ 入队衍生任务（thumb / proxy / clip_embed / face / rally_detect 候选）
+   │
+   ▼
+[3] 检测被删除的 asset：
+    asset 表中存在但磁盘上找不到的文件 → 标 status=missing（不删）
 ```
 
-### 3.2 命名规则
+### 3.4 文件位置变更的处理
 
-- `raw/` 文件名：`<原文件主名>_<sha256前6位>.<ext>`（防重命名冲突，hash 锁身份）
-- `derived/` 路径：与 raw 路径对齐，例 `derived/proxies/2026/05/22/<hash6>.mp4`
-- 所有路径在数据库里存**相对 `/media/` 的相对路径**，便于换挂载点
+由于不接管文件管理，**用户随时可能在 NAS 上移动/重命名文件**（手动整理、Immich 重组、新装其他工具）。设计要点：
 
-### 3.3 备份与重建
-
-| 内容 | 是否备份 | 说明 |
-|---|---|---|
-| `raw/` | 必须异地备份 | 原片不可再生，至少 RAID + 离线副本 |
-| `derived/` | 不备份 | 全部可从 raw 重建 |
-| `index/catalog.db` | 每日快照 | 备份用于快速恢复，但永远可从 raw + 标注导出文件重建 |
-| 标注数据 | 每日导出 JSONL 到 `index/exports/labels/` | 哪怕 catalog.db 全毁，标注也不丢 |
+- **sha256 是身份**，path 只是定位
+- 扫描发现一个 sha256 已知但 path 变更的文件 → 自动更新 path，不重新生成衍生物
+- 一个 asset 历史 path 列表存在 `asset_path_history`，便于追溯
+- `status = active | missing | suspicious`：missing 不主动删，等下一轮扫描确认或用户清理
 
 ---
 
-## 4. 数据模型
+## 4. 数据模型（v1.1 调整）
 
-### 4.1 核心实体一览
-
-```
-Asset       一个物理文件（照片或视频）
-Event       活动聚合（badminton_session / badminton_match / cycling / trip / daily）
-Segment     视频内时间片（rally / game_break / climb / descent / ...）
-Person      人物
-Place       地点（known + geocoded 双层）
-Tag         扁平命名空间标签
-Embedding   向量索引（CLIP 图文 / face）
-SmartAlbum  专题（保存的查询规则）
-Job         异步任务记录
-```
-
-### 4.2 表结构（SQLite DDL 草案，关键字段示意）
+### 4.1 Asset 表字段调整
 
 ```sql
--- 4.2.1 Asset
 CREATE TABLE asset (
-  id            INTEGER PRIMARY KEY,
-  path          TEXT NOT NULL UNIQUE,         -- 相对 /media/ 路径
-  sha256        TEXT NOT NULL UNIQUE,
-  phash         TEXT,                          -- 感知哈希，去重
-  media_type    TEXT NOT NULL,                 -- photo|video
-  mime          TEXT,
-  size_bytes    INTEGER,
-  width         INTEGER, height INTEGER,
-  duration      REAL,                          -- 视频时长秒
-  captured_at   INTEGER,                       -- Unix ts (EXIF)
-  ingested_at   INTEGER NOT NULL,              -- 入库时间
-  gps_lat       REAL, gps_lon REAL,            -- WGS84
-  gps_lat_gcj   REAL, gps_lon_gcj REAL,        -- 国内显示用
-  camera_make   TEXT, camera_model TEXT, lens TEXT,
-  quality_score REAL,                          -- 启发式质量分
-  canonical_id  INTEGER REFERENCES asset(id),  -- 同源副本主指针
-  privacy_level INTEGER DEFAULT 0,             -- 0=normal, 1=high(skip AI)
-  status        TEXT DEFAULT 'active'          -- active|archived|deleted
+  id              INTEGER PRIMARY KEY,
+  path            TEXT NOT NULL UNIQUE,    -- NAS 上的绝对路径或相对挂载点路径
+  scan_root_id    INTEGER NOT NULL,        -- 来自哪个 scan_root（决定默认 kind）
+  sha256          TEXT NOT NULL,
+  phash           TEXT,
+  media_type      TEXT NOT NULL,
+  mime            TEXT,
+  size_bytes      INTEGER,
+  mtime           INTEGER,                  -- 文件修改时间（增量扫描凭据）
+  width           INTEGER, height INTEGER,
+  duration        REAL,
+  captured_at     INTEGER,                  -- EXIF 拍摄时间
+  first_seen_at   INTEGER NOT NULL,         -- 第一次被本系统发现的时间
+  last_scan_at    INTEGER NOT NULL,         -- 最近一次确认存在的时间
+  gps_lat         REAL, gps_lon REAL,
+  gps_lat_gcj     REAL, gps_lon_gcj REAL,
+  camera_make     TEXT, camera_model TEXT, lens TEXT,
+  quality_score   REAL,
+  privacy_level   INTEGER DEFAULT 0,
+  status          TEXT DEFAULT 'active'     -- active | missing | suspicious
 );
+CREATE UNIQUE INDEX idx_asset_sha ON asset(sha256);
 CREATE INDEX idx_asset_captured ON asset(captured_at);
-CREATE INDEX idx_asset_gps ON asset(gps_lat, gps_lon);
-CREATE INDEX idx_asset_canonical ON asset(canonical_id);
+CREATE INDEX idx_asset_root ON asset(scan_root_id);
+CREATE INDEX idx_asset_status ON asset(status);
 
--- 4.2.2 Asset 路径别名（处理完全重复）
-CREATE TABLE asset_path_alias (
-  asset_id  INTEGER NOT NULL REFERENCES asset(id),
-  path      TEXT NOT NULL,
-  source    TEXT,                              -- inbox/phone, inbox/camera, ...
-  noted_at  INTEGER NOT NULL
+-- 历史路径（处理用户移动/重命名）
+CREATE TABLE asset_path_history (
+  asset_id   INTEGER NOT NULL REFERENCES asset(id),
+  path       TEXT NOT NULL,
+  noted_at   INTEGER NOT NULL,
+  reason     TEXT                            -- 'first_seen' | 'moved' | 'restored'
 );
 
--- 4.2.3 Event
-CREATE TABLE event (
-  id            INTEGER PRIMARY KEY,
-  kind          TEXT NOT NULL,                 -- badminton_session|badminton_match|cycling|trip|daily
-  parent_id     INTEGER REFERENCES event(id),  -- session→match
-  title         TEXT,
-  start_at      INTEGER NOT NULL,
-  end_at        INTEGER,
-  place_id      INTEGER REFERENCES place(id),
-  payload_json  TEXT,                          -- 领域专属字段
-  created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
-);
-CREATE INDEX idx_event_kind_time ON event(kind, start_at);
-CREATE INDEX idx_event_parent ON event(parent_id);
-
--- 4.2.4 Asset ↔ Event N:N
-CREATE TABLE asset_event (
-  asset_id INTEGER NOT NULL REFERENCES asset(id),
-  event_id INTEGER NOT NULL REFERENCES event(id),
-  role     TEXT,                                -- main|context|companion
-  PRIMARY KEY (asset_id, event_id)
-);
-
--- 4.2.5 Segment（视频内时间片）
-CREATE TABLE segment (
-  id            INTEGER PRIMARY KEY,
-  asset_id      INTEGER NOT NULL REFERENCES asset(id),
-  event_id      INTEGER REFERENCES event(id),
-  kind          TEXT NOT NULL,                 -- rally|game_break|climb|descent|...
-  start_ts      REAL NOT NULL,                 -- 视频内秒
-  end_ts        REAL NOT NULL,
-  payload_json  TEXT,
-  created_by    TEXT,                          -- ai|user|system
-  confidence    REAL,                          -- AI 置信度（人工时为 1.0）
-  created_at    INTEGER NOT NULL,
-  -- 生成列：常查字段提取
-  rally_idx       INTEGER GENERATED ALWAYS AS (json_extract(payload_json,'$.rally_idx')) STORED,
-  game_idx        INTEGER GENERATED ALWAYS AS (json_extract(payload_json,'$.game_idx')) STORED,
-  winner_side     TEXT    GENERATED ALWAYS AS (json_extract(payload_json,'$.winner_side')) STORED,
-  shot_count      INTEGER GENERATED ALWAYS AS (json_extract(payload_json,'$.shot_count')) STORED,
-  last_shot_type  TEXT    GENERATED ALWAYS AS (json_extract(payload_json,'$.last_shot_type')) STORED,
-  rally_quality   INTEGER GENERATED ALWAYS AS (json_extract(payload_json,'$.rally_quality')) STORED
-);
-CREATE INDEX idx_seg_asset ON segment(asset_id, start_ts);
-CREATE INDEX idx_seg_event ON segment(event_id, kind);
-CREATE INDEX idx_seg_shot ON segment(last_shot_type);
-CREATE INDEX idx_seg_winner ON segment(winner_side);
-
--- 4.2.6 Person（人物）
-CREATE TABLE person (
-  id          INTEGER PRIMARY KEY,
-  name        TEXT NOT NULL,
-  aliases     TEXT,                            -- JSON 数组
-  role        TEXT,                            -- self|family|friend|teammate|opponent
-  notes       TEXT,
-  created_at  INTEGER NOT NULL
-);
-
--- 人脸聚类簇
-CREATE TABLE face (
-  id          INTEGER PRIMARY KEY,
-  asset_id    INTEGER NOT NULL REFERENCES asset(id),
-  bbox        TEXT,                            -- JSON [x,y,w,h]
-  embedding   BLOB,                            -- 512f
-  cluster_id  INTEGER,                         -- 同人聚类
-  person_id   INTEGER REFERENCES person(id),   -- 命名后回填
-  confidence  REAL
-);
-CREATE INDEX idx_face_cluster ON face(cluster_id);
-CREATE INDEX idx_face_person ON face(person_id);
-
-CREATE TABLE asset_person (
-  asset_id  INTEGER NOT NULL REFERENCES asset(id),
-  person_id INTEGER NOT NULL REFERENCES person(id),
-  source    TEXT,                              -- face_recog|user_tag
-  PRIMARY KEY (asset_id, person_id)
-);
-
--- 4.2.7 Place（双层）
-CREATE TABLE place (
-  id          INTEGER PRIMARY KEY,
-  name        TEXT NOT NULL,
-  layer       TEXT NOT NULL,                   -- known|geocoded
-  aliases     TEXT,
-  geo_polygon TEXT,                            -- known 用 GeoJSON
-  center_lat  REAL, center_lon REAL,
-  region_path TEXT,                            -- "广东省/深圳市/福田区"
-  notes       TEXT
-);
-CREATE INDEX idx_place_layer ON place(layer);
-
--- 4.2.8 Tag（命名空间）
-CREATE TABLE tag (
-  id          INTEGER PRIMARY KEY,
-  ns          TEXT NOT NULL,                   -- category|event|play|style|topic|quality
-  key         TEXT NOT NULL,
-  display     TEXT,
-  description TEXT,
-  is_managed  INTEGER NOT NULL,                -- 1=受控, 0=自由
-  parent_id   INTEGER REFERENCES tag(id),
-  UNIQUE(ns, key)
-);
-
--- 多态标签关联（targets：asset / event / segment）
-CREATE TABLE tag_link (
-  tag_id      INTEGER NOT NULL REFERENCES tag(id),
-  target_kind TEXT NOT NULL,                   -- asset|event|segment
-  target_id   INTEGER NOT NULL,
-  source      TEXT,                            -- user|ai|rule
-  PRIMARY KEY (tag_id, target_kind, target_id)
-);
-CREATE INDEX idx_taglink_target ON tag_link(target_kind, target_id);
-
--- 4.2.9 Embedding 向量索引（sqlite-vec）
--- 由 sqlite-vec 扩展提供：vec_asset(rowid, embedding(512))
--- 业务侧只引用 rowid，不直接 DDL
-
--- 4.2.10 SmartAlbum（专题）
-CREATE TABLE smart_album (
-  id          INTEGER PRIMARY KEY,
-  name        TEXT NOT NULL UNIQUE,
-  rule_json   TEXT NOT NULL,                   -- 查询规则
-  cover_id    INTEGER REFERENCES asset(id),
-  created_at  INTEGER NOT NULL,
-  updated_at  INTEGER NOT NULL
-);
-
--- 4.2.11 Job（异步任务）
-CREATE TABLE job (
-  id          INTEGER PRIMARY KEY,
-  kind        TEXT NOT NULL,                   -- scan|transcode|embed|face|rally_detect|export
-  payload     TEXT,
-  state       TEXT NOT NULL,                   -- queued|running|done|failed|canceled
-  attempts    INTEGER DEFAULT 0,
-  error       TEXT,
-  created_at  INTEGER NOT NULL,
-  started_at  INTEGER,
-  finished_at INTEGER
-);
-CREATE INDEX idx_job_state ON job(state, kind);
-
--- 4.2.12 FTS5 全文检索（驼峰命名/标题/笔记）
-CREATE VIRTUAL TABLE fts_text USING fts5(
-  target_kind, target_id UNINDEXED,
-  text,
-  tokenize='porter unicode61'
+-- 扫描根（配置在 yaml，运行时同步到表）
+CREATE TABLE scan_root (
+  id           INTEGER PRIMARY KEY,
+  path         TEXT NOT NULL UNIQUE,
+  kind_hint    TEXT,                          -- photo|badminton|cycling|...
+  config_json  TEXT
 );
 ```
 
-### 4.3 羽毛球四层模型（关键专项）
+### 4.2 删除的字段/概念
+
+相对 v1.0 的清理：
+
+- ❌ `asset_path_alias`（不再处理"入库重复"，因为不入库）
+- ❌ `canonical_id`（不再做"同源副本降级"，原文件用户自己管理）
+- ❌ `archive/` 目录概念
+- ❌ `inbox/` 目录概念
+- ❌ "import" job kind
+
+### 4.3 其余实体不变
+
+Event / Segment / Person / Place / Tag / SmartAlbum / Job / Embedding / FTS5 都按 v1.0 4.2 节定义保留。羽毛球四层模型（Session/Match/Game/Rally）不变。
+
+---
+
+## 5. 处理流水线（v1.1 重写）
 
 ```
-Session   一次约球（2-3h，一群人在一个场馆）
-  │  Event(kind=badminton_session)
-  │  payload: { court, ball_brand, attendees[] }
-  │
-  ├─ Match  一场对阵（一对一/一对二）
-  │     Event(kind=badminton_match, parent_id=session.id)
-  │     payload: {
-  │       match_type: singles|doubles,
-  │       format: "21x3"|"15x3"|"11x1",
-  │       side_a: [person_id...], side_b: [person_id...],
-  │       final_score: [[21,18],[19,21],[21,15]],
-  │       winner: A|B,
-  │       duration_minutes: 35
-  │     }
-  │     │
-  │     ├─ Game  一局
-  │     │     Segment(kind=game) on whichever asset
-  │     │     payload: { game_idx, score_final:[a,b], duration }
-  │     │
-  │     └─ Rally  一回合
-  │           Segment(kind=rally) on asset
-  │           payload: {
-  │             rally_idx, game_idx,
-  │             server: person_id, serve_side: deuce|ad,
-  │             score_before:[a,b], score_after:[a,b],
-  │             winner_side: A|B, winner_player: person_id,
-  │             losing_reason: out|net|winner|unforced_error,
-  │             shot_count, last_shot_type,
-  │             rally_quality: 1-5,
-  │             tactical_pattern: drive_battle|front_back|four_corners|attack_block,
-  │             error_type: technique|tactic|physical|mental,
-  │             tags: [style/violent-smash, play/smash, ...],
-  │             learning_note, opponent_pattern
-  │           }
-  │
-  └─ Asset...  一段或多段视频，与 Match/Game 是 N:N
+┌─────────────────────────────────────────────────────────────┐
+│  nasmgr scan         ← 用户主动触发（或定时）                 │
+│  发现 / 更新 / 检测移动 / 标 missing                          │
+└────────────┬────────────────────────────────────────────────┘
+             │ 投递衍生任务（每个新/变更的 asset）
+             ▼
+┌─────────────────────────────────────────────────────────────┐
+│  nasmgr-worker      Mac 本地后台 worker                      │
+│  ├─ gen_thumb            缩略图 → 本地缓存                    │
+│  ├─ transcode_proxy      720p 代理片 → 本地缓存               │
+│  ├─ gen_keyframes        关键帧 → 本地缓存                    │
+│  ├─ clip_embed           CLIP 向量 → sqlite-vec              │
+│  ├─ face_detect          人脸 → face 表                      │
+│  ├─ face_cluster         周期：聚类                           │
+│  ├─ rally_detect_candidate  羽毛球：切回合候选                │
+│  └─ event_mining         周期：聚合 Session/Match/Trip       │
+└────────────┬────────────────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Web UI                                                       │
+│  ├─ 浏览 / 检索（八维查询）                                    │
+│  ├─ 羽毛球标注（键盘流）                                       │
+│  ├─ 专题（SmartAlbum）                                        │
+│  └─ 按需导出 ←— 唯一一个会写文件的动作                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**关键不变量**：
-- 视频边界 ≠ 比赛边界。一段 7-12 分钟视频可能横跨一局的中段，也可能涵盖两局过半。
-- `Segment(kind=rally)` 上的 `start_ts / end_ts` 是**视频内秒数**；`rally_idx` 全场连续编号；`game_idx` 局内编号。
-- `Match.payload.final_score` 是真值；任何回合 `score_after` 必须最终能与 final_score 对上（可作 lint）。
+---
 
-### 4.4 Tag 命名空间规范（强约束）
+## 6. 按需导出（v1.1 强调）
 
-| ns | 性质 | 词表来源 | 示例 |
+这是 NAS-MGR 唯一会**主动产生新文件**的动作，且只在用户明确触发时执行。
+
+### 6.1 导出类型
+
+| 类型 | 输入 | 输出 | 写到哪 |
 |---|---|---|---|
-| `category/*` | 闭集 | 系统硬编码 | `category/badminton`, `category/cycling`, `category/daily`, `category/trip` |
-| `event/*` | 闭集 | 插件维护 | `event/match`, `event/training`, `event/group-photo` |
-| `play/*` | 受控可扩展 | 词表文件，新增需确认 | `play/smash`, `play/drop`, `play/clear`, `play/long-rally` |
-| `style/*` | 受控可扩展 | 词表文件 | `style/violent-smash`(暴力扣杀), `style/old-school`(老登球路) |
-| `topic/*` | 自由 | 用户输入 | `topic/2026-青海骑行`, `topic/儿子毕业` |
-| `quality/*` | 闭集 | 系统硬编码 | `quality/highlight`, `quality/blur`, `quality/duplicate-near` |
+| 集锦视频 | Segment 列表 + 规则 | 拼接的 MP4 | 用户指定目录（默认 NAS `Exports/`） |
+| 相册 zip | Asset 列表 | zip 包，含原图或缩放图 | 同上 |
+| 元数据导出 | 查询结果 | JSON / CSV | 同上 |
+| 标注备份 | 全量 segment + tag | JSONL | 默认 NAS `.nasmgr/labels.jsonl`（每日自动） |
+| 边车元数据（可选） | 原文件 + asset 行 | XMP/JSON sidecar 写到原文件旁 | 需要用户开关明确同意 |
 
-新词进入 `play/*` `style/*` 受控词表前，UI 需弹出"是否确认新词，已有近义词：…"，迫使用户合并。
+### 6.2 导出 YAML 规则示例
+
+```yaml
+type: highlight_video
+filter:
+  segment.kind: rally
+  segment.tags: [style/violent-smash]
+  asset.captured_at: { gte: 2026-01-01 }
+order_by: rally_quality desc
+limit: 50
+intro_seconds: 0.5
+outro_seconds: 0.5
+transition: fade
+output: /Volumes/nas-media/Exports/violent-smash-2026.mp4
+```
+
+### 6.3 边车文件（可选高级特性）
+
+用户开启 `enable_sidecar: true` 后，标注变更可同步写一个 `<原文件名>.nasmgr.json` 到原文件旁，作为冗余备份。**这是写操作，需要 NAS 挂载点为可写，且默认关闭。**
 
 ---
 
-## 5. 处理流水线
-
-### 5.1 入库管线（C2 命令式）
-
-```
-nasmgr import [--dry-run] [--source phone|camera|badminton|cycling]
-```
-
-```
-inbox/* 文件
-   │
-   ▼
-[1] 探测（probe）           ffprobe / exiftool 拿元数据
-   │
-   ▼
-[2] 计算 sha256 + phash      去重判断
-   │
-   ▼
-[3] 判定                     ├─ 新文件      → 进 raw/
-                             ├─ 完全重复    → 登记 alias，不入 raw
-                             └─ 同源低质    → 进 archive/，挂 canonical_id
-   │
-   ▼
-[4] 物理移动                 raw/YYYY/MM/DD/<name>_<hash6>.<ext>
-   │
-   ▼
-[5] 写入 asset 表            含 EXIF/GPS/duration/quality_score
-   │
-   ▼
-[6] 投递衍生任务             transcode_proxy, gen_thumb, gen_keyframes,
-                             clip_embed, face_detect, rally_detect_candidate
-```
-
-### 5.2 衍生处理（worker 异步）
-
-| Job kind | 触发 | 输入 | 输出 |
-|---|---|---|---|
-| `transcode_proxy` | 视频入库 | raw 视频 | derived/proxies/.../*.mp4（720p H.264） |
-| `gen_thumb` | 入库 | raw 文件 | derived/thumbnails/{256,512,1024}/ |
-| `gen_keyframes` | 视频入库 | proxy | derived/keyframes/.../sec_NNN.jpg |
-| `clip_embed` | 入库 | 缩略图 / 关键帧 | sqlite-vec 向量 |
-| `face_detect` | 照片入库 / 视频关键帧 | InsightFace | face 行 + 聚类 |
-| `face_cluster` | 周期 | face.embedding | 更新 cluster_id |
-| `rally_detect_candidate` | 羽毛球 Asset | proxy 音频 + 运动量 | 候选 segment(kind=rally, created_by=ai) |
-| `event_mining` | 周期 | Asset 时空数据 | 产出/更新 Event |
-
-### 5.3 事件聚合规则（Event Mining）
-
-| Event 类型 | 触发条件 | 默认参数 |
-|---|---|---|
-| `badminton_session` | GPS 落入 known_place(layer=known, tag=羽毛球场) ∧ 持续 > 30min | 间隔 < 30min 合并 |
-| `cycling` | 有同名 GPX 同行 OR 轨迹 > 5km ∧ 平均速度 12-40km/h | 间隔 < 60min 合并 |
-| `trip` | 距家 > 50km ∧ 持续 > 12h | 跨日延伸；归家时收尾 |
-| `daily` | 不强制建 Event；按月做虚拟分组 | 仅作浏览容器 |
-
-事件一旦创建，**用户拥有最终修改权**：可以重命名、合并、拆分、删除。系统不再覆盖用户的修改。
-
-### 5.4 羽毛球回合切分启发式（E1 仅做候选）
-
-```
-输入：proxy 视频
-信号源：
-  - 音频：球拍击球瞬时高频脉冲 + 鞋摩擦地板的间歇
-  - 运动量：帧差或简易光流幅度（OpenCV）
-  - 静默检测：silencedetect 找到长静默段（可能是回合间）
-启发式：
-  1. 静默 ≥ 3s 视为回合分隔
-  2. 击球次数 < 2 的"片段"丢弃（漏切）
-  3. 段长 < 2s 或 > 60s 标记为 low-confidence
-输出：segment(kind=rally, created_by=ai, confidence=0.x, payload={start,end})
-```
-
-人工标注覆盖 AI 候选时，`created_by` 改为 `user`，`confidence=1.0`。
-
-### 5.5 标注 UI（H1 键盘流）
-
-| 键 | 动作 |
-|---|---|
-| `space` | 暂停/播放 |
-| `←/→` | -1s / +1s |
-| `shift + ←/→` | -5s / +5s |
-| `,` / `.` | 上一回合 / 下一回合 |
-| `[` / `]` | 设置当前回合的 start / end |
-| `1` / `2` | 标得分方为 A / B |
-| `s` | 弹出发球人选择（数字键选） |
-| `q/w/e/r/t/y/u` | 快速打 last_shot_type（smash/drop/clear/drive/push/net/lift） |
-| `g` | rally_quality + 1 |
-| `b` | rally_quality - 1 |
-| `h` | toggle highlight |
-| `n` | 加 note |
-| `ctrl+s` | 保存 |
-| `?` | 显示快捷键帮助 |
-
-**标注期望速度**：10 分钟视频 5-8 分钟标完。
-
-### 5.6 集锦导出
-
-```
-导出规则（YAML）：
-  filter:
-    segment.kind: rally
-    segment.tags: [style/violent-smash]
-    asset.captured_at: { gte: 2026-01-01 }
-  order_by: rally_quality desc
-  limit: 50
-  intro_seconds: 0.5         # 每段开头补 0.5s
-  outro_seconds: 0.5
-  transition: fade            # fade|cut
-  output: derived/exports/violent-smash-2026.mp4
-
-执行：
-  1. 解析规则 → 拿到 segment 列表
-  2. 计算每段的 [start-intro, end+outro]
-  3. ffmpeg 抽段 + concat
-  4. 落到 derived/exports/
-```
-
----
-
-## 6. 检索接口（八维查询）
-
-API 设计成"统一查询端点 + 组合过滤器"：
-
-```
-POST /api/search
-{
-  "target": "asset | event | segment",
-  "filters": {
-    "captured_at":  { "gte": ..., "lt": ... },
-    "person_ids":   [12, 34],
-    "place_ids":    [5],
-    "categories":   ["badminton"],
-    "tags":         ["style/violent-smash", "play/smash"],
-    "text":         "暴力扣杀",          // FTS5 + CLIP 混合
-    "where_sql":    "shot_count > 15"   // 受控范围 SQL where 片段
-  },
-  "order_by": [["rally_quality","desc"]],
-  "limit":  100,
-  "offset": 0
-}
-```
-
-**混合召回**：text 字段先走 FTS5；命中不足时调 CLIP 文本嵌入，做向量召回；最终融合排序。
-
-**聚合统计**：另开 `/api/stats` 端点，支持 `group_by` 在 person/place/month/category/shot_type/winner_side 上聚合。
-
----
-
-## 7. 与 Immich 的边界（D2 共生约定）
+## 7. 与 Immich 的边界（v1.1 微调）
 
 | 事项 | NAS-MGR | Immich |
 |---|---|---|
-| `raw/` 目录 | 写入方（入库管线） | 只读消费方（External Library 模式） |
-| 缩略图 | 自己生成在 derived/thumbnails/ | 自己生成（独立缓存） |
-| 人脸 | 自研（InsightFace + 自己的 person 表） | Immich 内置 |
-| 浏览/手机同步 | 不做 | **由 Immich 负责** |
-| 羽毛球/骑行专项 | **由 NAS-MGR 负责** | 不做 |
-| 元数据 | catalog.db | Immich Postgres（独立） |
+| NAS 上原始素材 | 只读扫描发现 | External Library 模式只读 |
+| 缩略图 | Mac 本地缓存 | 自己缓存 |
+| 人脸 | 自研索引 | 自身识别 |
+| 浏览/手机同步 | 不做 | **专责** |
+| 羽毛球/骑行/专题 | **专责** | 不做 |
 
-> 用户心智："手机同步、看日常照片 → Immich App；想复盘羽毛球、剪集锦、看专题 → NAS-MGR Web"。
+两者**互不干扰**，对 NAS 都是只读消费方。即使两者都装也不会"打架"，因为都不动原文件。
 
 ---
 
-## 8. 非功能需求
+## 8. 非功能需求（v1.1 调整）
 
 | 维度 | 要求 |
 |---|---|
-| 可重建性 | `derived/` `index/` 任意时刻清空都能从 `raw/` 重建（标注从 JSONL 恢复） |
-| 备份 | `raw/` 异地，`catalog.db` 每日快照，标注每日 JSONL 导出 |
-| 隐私 | `Asset.privacy_level=high` 时跳过 AI、跳过缩略图（或仅本地缩略图） |
-| 性能 | 入库 ≥ 500 文件/分钟（不含转码）；查询 P95 < 200ms（10 万级数据集） |
-| 容量预估 | 元数据 < 5GB；CLIP 向量 ≤ 10GB；代理片 ≤ 原视频 1/5；缩略图 ≤ 100GB |
-| 冷热分层 | 拍摄日期 > 3 年只索 Asset 元数据 + 缩略图，AI 按需触发 |
-| 安全 | API 仅 127.0.0.1 监听；后期家庭共享走反向代理 + 单用户 token |
-| 鲁棒性 | 所有 worker 任务可重入；NAS 短暂离线时排队，恢复后自动续跑 |
+| **可重建性** | catalog.db 删除可从扫描 + labels.jsonl 重建（标注不丢，索引重跑） |
+| **零侵入** | 删除 NAS-MGR 后 NAS 上只剩 `.nasmgr/` 一个目录可手动删，原文件无任何变化 |
+| 备份 | 用户自管 raw 备份；`.nasmgr/labels.jsonl` 也建议进备份链 |
+| 隐私 | privacy_level=high → 跳过 AI 处理 |
+| 性能 | 扫描 ≥ 5000 文件/分钟（仅元数据，不含 hash 大文件）；查询 P95 < 200ms |
+| 扫描鲁棒性 | 部分路径不可用时跳过 + 报告，不中断整次扫描 |
+| 文件移动追踪 | 用户重命名/移动后下次扫描自动识别（sha256 匹配） |
 
 ---
 
-## 9. 实施分期
+## 9. 实施分期（v1.1 调整）
 
 | 阶段 | 周期 | 目标 | 完工标志 |
 |---|---|---|---|
-| **P0 · 基础入库** | 1-2 周 | nasmgr import + 缩略图 + Web 时间轴 | 全 5TB 扫完，时间轴可滚 |
-| **P1 · 人物/地点/标签** | 1-2 周 | 人脸聚类、Place 词表、Tag 命名空间 | 能按"人 × 地点 × 月份"筛选 |
-| **P2 · 羽毛球专项** | 2-3 周 | Match/Rally 模型、回合候选、键盘流标注 | 一场比赛 5-8 分钟标完 |
-| **P3 · 语义检索** | 1-2 周 | CLIP 文本召回 + FTS5 + 混合排序 | "夕阳骑车"能召回 |
-| **P4 · 集锦与骑行** | 1-2 周 | YAML 规则导出 + GPX 视频对齐 | 一键出"暴力扣杀合集.mp4" |
-| **P5 · Immich 接入** | 1 周 | Immich 容器 + External Library 指向 raw/ | 手机同步通畅 |
+| **P0 · 扫描与索引** | 1-2 周 | nasmgr scan + 缩略图 + Web 时间轴 | 全 5TB 扫完，时间轴可滚 |
+| **P1 · 人物/地点/标签** | 1-2 周 | 人脸聚类、Place 词表、Tag 命名空间 | 三维筛选 |
+| **P2 · 羽毛球专项** | 2-3 周 | Match/Rally + 回合候选 + 键盘流标注 | 一场比赛 5-8 分钟标完 |
+| **P3 · 语义检索** | 1-2 周 | CLIP + FTS5 混合排序 | "夕阳骑车"能召回 |
+| **P4 · 按需导出** | 1-2 周 | 集锦 YAML 规则 + GPX 视频对齐 | 一键出"暴力扣杀合集.mp4" |
+| **P5 · Immich 共存** | 1 周 | Immich 容器同 raw 路径，互不干扰 | 手机同步通畅 |
 | **P6 · 共享与远程**（可选） | 1-2 周 | 反向代理 + 多用户 token | 家人/球友远程访问 |
 
 ---
 
-## 10. 仓库目录草案（实施时落地）
+## 10. 仓库目录草案
 
 ```
 NAS-MGR/
 ├── docs/
 │   ├── SYSTEM_DESIGN.md          ← 本文
-│   ├── DATA_MODEL.md             ← 表结构详解
-│   ├── BADMINTON_SPEC.md         ← 羽毛球四层模型 + 标注规范
-│   ├── PLACE_DICT.md             ← known_places 词表
-│   └── TAG_DICT.md               ← 受控词表
+│   ├── DATA_MODEL.md
+│   ├── BADMINTON_SPEC.md
+│   ├── PLACE_DICT.md
+│   └── TAG_DICT.md
+├── nasmgr.config.yaml            ← 扫描根配置（用户填）
 ├── nasmgr/
 │   ├── api/                      ← FastAPI
 │   ├── worker/                   ← 异步任务
 │   ├── core/                     ← 数据模型/规则引擎
-│   ├── importers/                ← 入库管线
+│   ├── scanner/                  ← 扫描发现器（替代 importers/）
 │   ├── ai/                       ← CLIP / face / rally_detect
+│   ├── exporter/                 ← 集锦/相册/元数据导出
 │   └── cli/                      ← nasmgr 命令行
-├── web/                          ← Vue/Svelte SPA
+├── web/                          ← Web SPA
 ├── deploy/
 │   ├── docker-compose.immich.yml
 │   └── autofs.conf.sample
@@ -599,24 +383,36 @@ NAS-MGR/
 
 ## 11. 待办（Open Questions）
 
-定稿前未解决，进入 P0 前需要确认：
-
-1. **NAS 型号/系统**：群晖/威联通/TrueNAS/自建？影响 SMB 性能调优和后续是否在 NAS 跑容器。
-2. **共享需求时间表**：是否在 6 个月内引入家人/球友访问？影响是否要早早把权限模型留好钩子。
-3. **羽毛球录制硬件**：手机三脚架定机位？双机位？是否打算后续上稳定球场摄像头？影响 rally_detect 启发式的参数。
-4. **常去地点清单**：先列 5-10 个 known_places（家、公司、橙天羽毛球馆、美沙集合点……）作为 P1 词表种子。
-5. **GPX 来源**：码表（佳明/迈金）还是手机 App（咕咚/Strava）？影响导入器写哪种格式优先。
+1. **NAS 型号/系统**：影响 SMB 性能调优。
+2. **共享需求时间表**：6 个月内是否引入家人/球友访问？
+3. **羽毛球录制硬件**：单机位/双机位/未来上球场摄像头？
+4. **常去地点清单**：列 5-10 个 known_places 作为 P1 词表种子。
+5. **GPX 来源**：码表（佳明/迈金）还是手机 App（咕咚/Strava）？
+6. **NAS 现有目录结构**：让我看一眼顶层目录树（`tree -L 2 /Volumes/nas-media`），用来配 `scan_roots` 初始模板。
 
 ---
 
-## 12. 文档维护约定
+## 12. 修订历史
+
+### v1.1 · 2026-05-22
+- **重大架构修订**：废弃"入库管线"概念，改为只读外挂索引。
+- 删除 inbox/raw/derived/archive 目录强约束；NAS 现有结构保持不变。
+- 衍生物默认存 Mac 本地缓存，NAS 上仅 `.nasmgr/catalog.db` + `labels.jsonl`。
+- 新增 `nasmgr.config.yaml` 配置驱动扫描根。
+- 新增"文件移动追踪"机制（sha256 身份 + asset_path_history）。
+- 调整 Asset 表字段：删除 canonical_id / asset_path_alias，新增 scan_root_id / mtime / status / first_seen_at / last_scan_at。
+- 实施分期 P0 由"基础入库"改为"扫描与索引"。
+- 强调"按需导出"是唯一会写文件的动作。
+
+### v1.0 · 2026-05-22
+- 初稿定型：8 项决策（A2/B1/C2/D2/E1/F1/G1/H1）。
+- 通用核心数据模型 + 羽毛球四层 + 处理流水线 + 八维检索。
+
+---
+
+## 13. 文档维护约定
 
 - 本文件是**整个项目的源头真理**，任何与代码/讨论的冲突以本文件为准。
 - 每次设计变更必须**先改本文档**，再进入实施。
-- 决策记录（Decision Record）只增不删；如某项决策被推翻，加"v2 修订"段落，保留 v1。
-- 实施过程中发现设计漏洞，记录到第 11 节"待办"，下次定稿合并。
-
----
-
-> **当前状态**：v1.0 方案定型，可启动 P0。
-> 下一步建议：用户回答第 11 节的 5 个问题后，开 P0 实施票。
+- 决策记录只增不删；推翻的决策作为修订段落保留。
+- 实施过程中发现设计漏洞，记录到第 11 节，下次定稿合并。
