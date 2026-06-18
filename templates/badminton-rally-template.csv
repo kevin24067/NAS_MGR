@@ -1,0 +1,5 @@
+id,asset_path,asset_sha256,start_ts,end_ts,session_id,match_id,game_idx,rally_idx,match_type,side_a,side_b,server,serve_side,score_before_a,score_before_b,score_after_a,score_after_b,winner_side,winner_player,losing_reason,shot_count,last_shot_type,rally_quality,tactical_pattern,error_type,tags,highlight,note
+f3a92c-r017,badminton/2026-06-15-橙天/court3-game1.mp4,f3a92c8b...,402.3,423.8,2026-06-15-orange-court,2026-06-15-m01,1,17,doubles,"KH;老王","小李;老张",老王,deuce,8,8,9,8,A,KH,winner,23,smash,5,four_corners,,"style/violent-smash;play/long-rally",TRUE,23拍来回最后反手扣直线
+f3a92c-r018,badminton/2026-06-15-橙天/court3-game1.mp4,f3a92c8b...,428.1,434.6,2026-06-15-orange-court,2026-06-15-m01,1,18,doubles,"KH;老王","小李;老张",KH,ad,9,8,9,9,B,,unforced_error,4,net_shot,2,,mental,play/short-rally,FALSE,接发推后场我接漏
+,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,,,,,

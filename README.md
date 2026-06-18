@@ -23,9 +23,12 @@
 
 | 文档 | 内容 |
 |---|---|
-| [SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) | 方案定稿（决策记录、架构、数据模型、流水线、分期） |
+| [SYSTEM_DESIGN.md](docs/SYSTEM_DESIGN.md) | 总体方案（决策记录、架构、数据模型、流水线、分期）|
+| [BADMINTON_SPEC.md](docs/BADMINTON_SPEC.md) | 羽毛球专项数据规范（labels.jsonl 行格式、枚举、约束）|
+| [TAG_DICT.md](docs/TAG_DICT.md) | 受控标签词表（命名空间、可扩展规则）|
+| [templates/](templates/) | 标注模板（CSV / jsonl + 使用说明）|
 
-后续会陆续补充 DATA_MODEL.md / BADMINTON_SPEC.md / PLACE_DICT.md / TAG_DICT.md。
+后续会陆续补充 DATA_MODEL.md / PLACE_DICT.md。
 
 ## 实施分期
 
